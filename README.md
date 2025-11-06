@@ -15,7 +15,9 @@ In this file, we provide the code for the evaluation of [LLaDA-8B-Base](https://
 [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct) and [LLaDA 1.5](https://arxiv.org/abs/2505.19223).
 
 ## Eval Harness
-Please refer to `lm_eval.sh` for the required dependencies and execution commands.
+```bash
+bash eval.sh
+```
 
 For **the ppl tasks of LLaDA-8B-Base**, the evaluation results are as follows:
 
