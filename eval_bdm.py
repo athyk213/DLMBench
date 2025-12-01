@@ -18,11 +18,11 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-@register_model("bd3lm_dist")
+@register_model("bdm_dist")
 class BD3LMEvalHarness(LM):
     def __init__(
         self,
-        model_path='',
+        pretrained='',
         mask_id=126336,
         max_length=1024,
         batch_size=32,
@@ -38,7 +38,7 @@ class BD3LMEvalHarness(LM):
         if self.accelerator:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        self.model = AutoModel.from_pretrained(pretrained, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
         self.model.eval()
 
         self.device = torch.device(device)
@@ -48,7 +48,7 @@ class BD3LMEvalHarness(LM):
         else: 
             self.model = self.model.to(device)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
         self.mask_id = mask_id
         self.mc_num = mc_num
         self.batch_size = int(batch_size)

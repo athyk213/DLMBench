@@ -236,7 +236,7 @@ class TimestepEmbedder(nn.Module):
       embedding = torch.cat(
         [embedding,
          torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
+    return embedding.to(t.dtype)
 
   def forward(self, t):
     t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
@@ -360,8 +360,7 @@ class DDiTBlock(nn.Module):
         ctx = torch.autocast(device_type=qkv.device.type, enabled=False)
     with ctx:
       cos, sin = rotary_cos_sin
-      qkv = apply_rotary_pos_emb_torchscript(
-        qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
+      qkv = apply_rotary_pos_emb_torchscript(qkv, cos.to(qkv.dtype), sin.to(qkv.dtype))
     return qkv
 
   def cross_attn(self, x, qkv, mask=None):
@@ -405,6 +404,7 @@ class DDiTBlock(nn.Module):
     if mask is not None and not sample_mode:
       n = mask.shape[-1] // 2
       qkv_x = self.get_qkv(x[:,:n], rotary_cos_sin)
+      # import pdb; pdb.set_trace()
       qkv_x0 = self.get_qkv(x[:,n:], rotary_cos_sin)
       qkv = torch.cat((qkv_x, qkv_x0), dim=1)
     else:

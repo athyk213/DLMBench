@@ -29,11 +29,11 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-@register_model("llada_dist")
+@register_model("mdm_dist")
 class LLaDAEvalHarness(LM):
     def __init__(
         self,
-        model_path='',
+        pretrained='',
         mask_id=126336,
         max_length=4096,
         batch_size=32,
@@ -49,7 +49,7 @@ class LLaDAEvalHarness(LM):
     ):
         '''
         Args:
-            model_path: LLaDA-8B-Base model path.
+            pretrained: LLaDA-8B-Base model path.
             mask_id: The token id of [MASK] is 126336.
             max_length: the max sequence length.
             batch_size: mini batch size.
@@ -76,7 +76,7 @@ class LLaDAEvalHarness(LM):
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        self.model = AutoModel.from_pretrained(pretrained, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
         self.model.eval()
 
         self.device = torch.device(device)
@@ -89,7 +89,7 @@ class LLaDAEvalHarness(LM):
             self.model = self.model.to(device)
 
         self.mask_id = mask_id
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
 
         self.mc_num = mc_num
         self.batch_size = int(batch_size)

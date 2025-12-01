@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --output=./logs/train_%x_%j.log
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --gres=gpu:8
 #SBATCH --mem=512G
-#SBATCH --partiti. n=p4-main
-#SBATCH --time=1-00:00:00
+#SBATCH --partition=p5-main
+#SBATCH --time=1-12:00:00
 #SBATCH --ntasks-per-node=1         # One task per GPU? per node
 #SBATCH --cpus-per-task=96
-#SBATCH --constraint=p5en48xlarge
 
 # source ~/.bashrc
 # conda activate ibm
@@ -23,20 +22,20 @@ export WANDB_MODE=disabled
 export CUDA_LAUNCH_BLOCKING=1
 
 
+CONFIG_NAME=$SLURM_JOB_NAME  # "mdm_700m" "bdm_700m" "ar_700m"
 # --- Detect nodes ---
 if [[ "$SLURM_JOB_NAME" == "intern" ]]; then
     echo "Interactive mode detected."
     NNODES=1
-    # NGPUS=1
+    NGPUS=1
+    CONFIG_NAME="ar_700m"
     command="torchrun"
-    CONFIG_NAME="bd3lm_400m"
     head_node_ip=$(hostname --ip-address)
 else
     nodes=($(scontrol show hostnames $SLURM_JOB_NODELIST))
     head_node=${nodes[0]}
     NNODES=${#nodes[@]}
     command="srun torchrun"
-    CONFIG_NAME="bd3lm_400m"
     head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 fi
 
@@ -85,7 +84,7 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --gradient_accumulation_steps $gradient_accumulation_steps \
         --report_to none \
         --max_steps $max_steps \
-        --context_len 4096 \
+        --context_len 2048 \
         --warmup_ratio 0.01 \
         --weight_decay 0.1 \
         --learning_rate 4e-4 \

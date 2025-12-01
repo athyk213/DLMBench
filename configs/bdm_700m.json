@@ -3,7 +3,7 @@
   "model_type": "bd3lm",
   "block_size": 128,
   "vocab_size": 126464,
-  "model_length": 1024,
+  "model_length": 2048,
   "cross_attn": true,
   "adaln": true,
   "attn_backend": "flex",

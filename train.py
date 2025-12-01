@@ -267,29 +267,30 @@ def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized
 @dataclass
 class DataCollatorForRandomTimeMask:
     tokenizer: PreTrainedTokenizerBase
-    pad_to_multiple_of: int = None
-    all_attend: bool = False
-    avoid_special_masking: bool = True
+    pad_to_multiple_of: int = None         # 可选：方便开启 flash-attn 等
+    all_attend: bool = False               # 若 True，则忽略 pad 的 attention_mask，全 1
+    avoid_special_masking: bool = True     # 不遮盖特殊 token
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # 1) pad（让 tokenizer 生成 attention_mask；也可以 all_attend=True 全 1）
         batch = self.tokenizer.pad(
             features,
             padding=True,
             return_tensors="pt",
             pad_to_multiple_of=self.pad_to_multiple_of
         )
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
+        input_ids = batch["input_ids"]               # (B, L)
+        attention_mask = batch["attention_mask"]     # (B, L)
 
         B, L = input_ids.size()
         device = input_ids.device
 
-        t = torch.rand(B, dtype=torch.float32) # Shape (B,)
+        # 2) 采样 t（按样本一个 t），扩展到 (B, L)
+        t = torch.rand(B, 1, dtype=torch.bfloat16)              # CPU
         t = torch.clamp_min(t, 1e-4)
-        
-        # Create a broadcasted version for masking logic (B, L)
-        t_broadcast = t.view(B, 1).repeat(1, L).to(device)
+        t_sampled = t.repeat(1, L)  
 
+        # 3) 形成可遮盖位置（默认不遮盖特殊符号）
         can_mask = torch.ones_like(input_ids, dtype=torch.bool, device=device)
         if self.avoid_special_masking:
             special_ids = set(self.tokenizer.all_special_ids)
@@ -298,16 +299,19 @@ class DataCollatorForRandomTimeMask:
                 for sid in special_ids:
                     special_mask |= (input_ids == sid)
                 can_mask &= ~special_mask
+        # 若不想在 padding 上遮盖，也可加：can_mask &= (attention_mask.bool())
 
-        # Use broadcasted t for Bernoulli sampling
-        bern = torch.bernoulli(t_broadcast).bool()
+        # 4) 以概率 t 进行逐 token 采样，但只允许在 can_mask==True 的位置
+        bern = torch.bernoulli(t_sampled).bool()
         mask = bern & can_mask
+
+        # 5) 生成 corrupted 与 labels
 
         mask_token_id = self.tokenizer.mask_token_id
         if mask_token_id is None:
-            raise ValueError("tokenizer.mask_token_id is None.")
+            raise ValueError("tokenizer.mask_token_id is None. Please set a mask token for the tokenizer.")
         corrupted = input_ids.masked_fill(mask, mask_token_id)
-        labels = input_ids.masked_fill(~mask, -100)
+        labels = input_ids.masked_fill(~mask, -100)  # 只在被遮盖处监督
 
         if self.all_attend:
             attention_mask = torch.ones_like(attention_mask)
@@ -316,10 +320,39 @@ class DataCollatorForRandomTimeMask:
             "input_ids": corrupted,
             "labels": labels,
             "attention_mask": attention_mask,
-            "t": t,  # Passing 1D t (B,)
+            "t": t,  # 传给 Trainer.compute_loss 做 1/t 加权
         }
 
-class RandomTimeMaskTrainer(Trainer):
+
+class MaskedDiffusionTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # 取出 labels 和 t，避免传进 model(**inputs)
+        labels = inputs.pop("labels")
+        t = inputs.pop("t")  # (B, L)
+
+        outputs = model(**inputs)
+        logits = outputs.logits  # (B, L, V)
+
+        B, L, V = logits.shape
+        per_tok = F.cross_entropy(
+            logits.view(-1, V),
+            labels.view(-1),
+            reduction="none",
+            ignore_index=-100
+        ).view(B, L)
+
+        # 1/t 加权；注意 t 与 per_tok 的形状一致
+        loss = (per_tok / t).mean()
+
+        # 把 t 放回去，以免后续 callback 需要
+        inputs["t"] = t
+        if return_outputs:
+            return loss, outputs
+        return loss
+
+
+
+class BlockDiffusionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         t = inputs.pop("t") # This is (B,)
@@ -328,7 +361,7 @@ class RandomTimeMaskTrainer(Trainer):
             inputs.pop("attention_mask")
 
         # Pass 1D timesteps to model
-        inputs["timesteps"] = t.to(inputs["input_ids"].device)
+        inputs["timesteps"] = t.squeeze().to(inputs["input_ids"].device)
         
         outputs = model(**inputs)
         logits = outputs.logits
@@ -370,7 +403,20 @@ def train():
     #! Config and Model
     count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     config = AutoConfig.from_pretrained(model_args.config)
-    model = AutoModel.from_config(config)
+    if "bd" in model_args.config.lower():
+        DiffusionTrainer = BlockDiffusionTrainer
+        Model_CLS = AutoModel
+        config.model_length = training_args.context_len // 2
+    elif "mdm" in model_args.config.lower():
+        DiffusionTrainer = MaskedDiffusionTrainer
+        Model_CLS = AutoModel
+    elif "ar" in model_args.config.lower():
+        from transformers import Trainer as DiffusionTrainer
+        config.max_position_embeddings = training_args.context_len
+        Model_CLS = transformers.AutoModelForCausalLM
+
+    model = Model_CLS.from_config(config)
+
     if training_args.local_rank == 0:
         print(f"Training new model from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
 
@@ -428,7 +474,7 @@ def train():
         pad_to_multiple_of=8,     # 可按需设置
         all_attend=False,         # 若想“全 1 mask”，设 True
         avoid_special_masking=True
-    )
+    ) if "ar" not in model_args.config.lower() else None
 
     data_module = dict(
         train_dataset=train_dataset, eval_dataset=valid_dataset, data_collator=data_collator
@@ -462,7 +508,7 @@ def train():
         print("*** Set ignore_data_skip=True for streaming mode to save time ***")
 
 
-    trainer = RandomTimeMaskTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer = DiffusionTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
     model.config.use_cache = False
 
     if training_args.do_train:
