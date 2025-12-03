@@ -404,7 +404,6 @@ class DDiTBlock(nn.Module):
     if mask is not None and not sample_mode:
       n = mask.shape[-1] // 2
       qkv_x = self.get_qkv(x[:,:n], rotary_cos_sin)
-      # import pdb; pdb.set_trace()
       qkv_x0 = self.get_qkv(x[:,n:], rotary_cos_sin)
       qkv = torch.cat((qkv_x, qkv_x0), dim=1)
     else:

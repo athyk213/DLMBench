@@ -32,7 +32,10 @@ from transformers import Trainer, AutoTokenizer, AutoConfig, AutoModel, PreTrain
 from datasets import load_dataset, load_from_disk, IterableDataset
 from models import *
 from typing import Dict, List, Union
+from torch.serialization import add_safe_globals
+from deepspeed.runtime.fp16.loss_scaler import LossScaler
 
+add_safe_globals([LossScaler])
 
 
 CPU_COUNT = os.cpu_count()

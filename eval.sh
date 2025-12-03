@@ -9,7 +9,7 @@ export HF_DATASETS_TRUST_REMOTE_CODE=true
 export HF_TOKEN=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
 
 
-MODEL_PATH='bdm_700m/checkpoint-4400'  # path to the fine-tuned LLaDA-400M model
+MODEL_PATH='ar_700m/checkpoint-5500'  # path to the fine-tuned LLaDA-400M model
 if [[ $MODEL_PATH == *mdm* ]]; then
     SCRIPT='eval_mdm.py'
     MODEL='mdm_dist'

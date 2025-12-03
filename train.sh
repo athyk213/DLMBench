@@ -27,7 +27,7 @@ CONFIG_NAME=$SLURM_JOB_NAME  # "mdm_700m" "bdm_700m" "ar_700m"
 if [[ "$SLURM_JOB_NAME" == "intern" ]]; then
     echo "Interactive mode detected."
     NNODES=1
-    NGPUS=1
+    # NGPUS=1
     CONFIG_NAME="ar_700m"
     command="torchrun"
     head_node_ip=$(hostname --ip-address)
@@ -71,7 +71,7 @@ max_steps=$(( max_tokens / (global_batch_size * 4096) ))
 # python -m debugpy --wait-for-client --listen 0.0.0.0:5000 -m torch.distributed.launch
 
 ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
-        --rdzv_endpoint $head_node_ip:29500 \
+        --rdzv_endpoint $head_node_ip:29512 \
         --rdzv_id $RANDOM \
         --rdzv_backend c10d \
         train.py \
@@ -79,7 +79,7 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --dataset_cache_dir "../../hf_datasets/SlimPajama-627B" \
         --output_dir "output/${CONFIG_NAME}" \
         --config ${CONFIG_PATH} \
-        --resume_from_checkpoint false \
+        --resume_from_checkpoint true \
         --per_device_train_batch_size $micro_batch_size \
         --gradient_accumulation_steps $gradient_accumulation_steps \
         --report_to none \
@@ -93,7 +93,6 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --lr_scheduler_type cosine_with_min_lr \
         --lr_scheduler_kwargs '{"min_lr_rate": 0.1}' \
         --save_steps 100 \
-        --save_total_limit 2 \
         --logging_steps 10 \
         --do_train True \
         --do_predict True \

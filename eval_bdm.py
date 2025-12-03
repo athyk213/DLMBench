@@ -28,6 +28,7 @@ class BD3LMEvalHarness(LM):
         batch_size=32,
         mc_num=128,
         device="cuda",
+        dtype=torch.bfloat16,
         **kwargs,
     ):
         super().__init__()
@@ -38,7 +39,10 @@ class BD3LMEvalHarness(LM):
         if self.accelerator:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
-        self.model = AutoModel.from_pretrained(pretrained, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
+        config = AutoConfig.from_pretrained(pretrained, trust_remote_code=True, torch_dtype=dtype, **model_kwargs)
+        config.attn_backend = 'sdpa'
+        self.model = AutoModel.from_config(config)
+        # self.model.config.attn_backend = 'sdpa'
         self.model.eval()
 
         self.device = torch.device(device)
@@ -48,6 +52,7 @@ class BD3LMEvalHarness(LM):
         else: 
             self.model = self.model.to(device)
 
+        self.dtype = dtype
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
         self.mask_id = mask_id
         self.mc_num = mc_num
@@ -76,7 +81,7 @@ class BD3LMEvalHarness(LM):
         
         noisy_batch = torch.where(is_mask, self.mask_id, batch)
         
-        return noisy_batch, timesteps_1d, timesteps_2d
+        return noisy_batch, timesteps_1d.to(dtype=self.dtype), timesteps_2d.to(dtype=self.dtype)
 
     @torch.no_grad()
     def get_loglikelihood(self, prefix, target):
@@ -89,7 +94,8 @@ class BD3LMEvalHarness(LM):
             noisy_seq, t_1d, t_2d = self._forward_process(seq, prompt_index)
             
             # Pass 1D timesteps to model
-            logits = self.model(input_ids=noisy_seq, timesteps=t_1d).logits
+            # import pdb; pdb.set_trace()
+            logits = self.model(input_ids=noisy_seq, timesteps=t_1d, sample_mode=True).logits
             
             mask_indices = noisy_seq == self.mask_id
             
