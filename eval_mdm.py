@@ -38,7 +38,7 @@ class LLaDAEvalHarness(LM):
         max_length=4096,
         batch_size=32,
         mc_num=128,
-        is_check_greedy=True,
+        is_check_greedy=False,
         cfg=0.,
         steps=1024,
         gen_length=1024,
@@ -66,27 +66,23 @@ class LLaDAEvalHarness(LM):
         '''
         super().__init__()
 
-        accelerator = accelerate.Accelerator()
-        if accelerator.num_processes > 1:
-            self.accelerator = accelerator
-        else:
-            self.accelerator = None
+        self.accelerator = accelerate.Accelerator()
         
         model_kwargs = {}
-        if self.accelerator is not None:
+        if self.accelerator.num_processes > 1:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
 
         self.model = AutoModel.from_pretrained(pretrained, trust_remote_code=True, torch_dtype=torch.bfloat16, **model_kwargs)
         self.model.eval()
 
-        self.device = torch.device(device)
-        if self.accelerator is not None:
+        if self.accelerator.num_processes > 1:
             self.model = self.accelerator.prepare(self.model)
-            self.device = torch.device(f'{self.accelerator.device}')
-            self._rank = self.accelerator.local_process_index
-            self._world_size = self.accelerator.num_processes
-        else: 
-            self.model = self.model.to(device)
+        else:
+            self.model = self.model.to(self.accelerator.device)
+
+        self.device = self.accelerator.device
+        self._rank = self.accelerator.local_process_index
+        self._world_size = self.accelerator.num_processes
 
         self.mask_id = mask_id
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
@@ -274,8 +270,6 @@ class LLaDAEvalHarness(LM):
             generated_answer_ids = self.tokenizer(generated_answer)["input_ids"]
             generated_answer = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
             out.append(generated_answer)
-
-            self.accelerator.wait_for_everyone()
 
         return out
 
