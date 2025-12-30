@@ -571,7 +571,13 @@ def train():
                     self.header_written = True
                 writer.writerow(row)
 
-    trainer = DiffusionTrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=[CSVLoggerCallback()], **data_module)
+    # Determine log path based on config name
+    config_name = os.path.splitext(os.path.basename(model_args.config))[0]
+    os.makedirs("logs", exist_ok=True)
+    log_path = os.path.join("logs", f"training_logs_{config_name}.csv")
+    print(f"*** Saving training logs to {log_path} ***")
+
+    trainer = DiffusionTrainer(model=model, tokenizer=tokenizer, args=training_args, callbacks=[CSVLoggerCallback(log_path=log_path)], **data_module)
     model.config.use_cache = False
 
     if training_args.do_train:
