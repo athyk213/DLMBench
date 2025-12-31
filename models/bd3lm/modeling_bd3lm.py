@@ -229,7 +229,7 @@ class TimestepEmbedder(nn.Module):
       - math.log(max_period)
       * torch.arange(start=0, end=half, dtype=torch.float32)
       / half).to(device=t.device)
-    args = t[:, None].float() * freqs[None]
+    args = t.unsqueeze(-1).float() * freqs
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
       embedding = torch.cat(
@@ -545,9 +545,10 @@ class DITBackbone(nn.Module):
         partial(block_diff_mask, block_size=block_size, n=seqlen),
         B=None, H=None, Q_LEN=seqlen*2, KV_LEN=seqlen*2)
     elif attn_backend == 'sdpa' or not FLEX_ATTN_AVAILABLE:
-      self.mask = block_diff_mask(
+      mask = block_diff_mask(
         b=None, h=None, q_idx=torch.arange(seqlen*2)[:, None], 
         kv_idx=torch.arange(seqlen*2)[None, :], block_size=block_size, n=seqlen)
+      self.register_buffer('mask', mask, persistent=False)
     else:
       raise ValueError('Unknown attention backend')
 
@@ -572,7 +573,18 @@ class DITBackbone(nn.Module):
       n = self.mask.shape[-1] // 2
       # use block-causal mask only during sampling
       if not sample_mode:
-        rotary_cos_sin = self.rotary_emb(x[:, :self.n])
+        curr_half_len = x.shape[1] // 2
+        if curr_half_len != self.n:
+          n = curr_half_len
+          if self.config.attn_backend == 'flex' and FLEX_ATTN_AVAILABLE:
+            mask = create_block_mask(
+              partial(block_diff_mask, block_size=self.block_size, n=n),
+              B=None, H=None, Q_LEN=n*2, KV_LEN=n*2).to(x.device)
+          else:
+            mask = block_diff_mask(
+              b=None, h=None, q_idx=torch.arange(n*2)[:, None], 
+              kv_idx=torch.arange(n*2)[None, :], block_size=self.block_size, n=n).to(x.device)
+        rotary_cos_sin = self.rotary_emb(x[:, :n])
       else:
         if self.blocks[0].kv_cache is not None:
           mask = None

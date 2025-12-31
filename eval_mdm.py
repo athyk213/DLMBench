@@ -84,8 +84,13 @@ class LLaDAEvalHarness(LM):
         self._rank = self.accelerator.local_process_index
         self._world_size = self.accelerator.num_processes
 
-        self.mask_id = mask_id
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+        if self.tokenizer.mask_token_id is not None:
+            self.mask_id = self.tokenizer.mask_token_id
+            print(f"Using tokenizer mask_id: {self.mask_id}")
+        else:
+            self.mask_id = mask_id
+            print(f"Using default mask_id: {self.mask_id}")
 
         self.mc_num = mc_num
         self.batch_size = int(batch_size)

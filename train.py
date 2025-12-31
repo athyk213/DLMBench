@@ -26,6 +26,7 @@ import csv
 from itertools import chain
 from dataclasses import dataclass, field
 from typing import Optional
+import inspect
 
 # import wandb
 import transformers
@@ -356,22 +357,22 @@ class DiffusionTrainer(Trainer):
         if "attention_mask" in inputs: 
             inputs.pop("attention_mask")
         
-        # Prepare 1D timesteps for model conditioning
         t_mean = t.mean(dim=1) if t.ndim > 1 else t.squeeze()
-        inputs["timesteps"] = t_mean
-        
+        model_module = model.module if hasattr(model, "module") else model
+        forward_params = inspect.signature(model_module.forward).parameters
+        if "timesteps" in forward_params:
+            inputs["timesteps"] = t_mean
+
         outputs = model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         
-        # BDM Specific: Model output might be length L (just xt), but labels are 2L (xt + x0)
-        # We slice labels to match logits
         if logits.shape[1] != labels.shape[1]:
             labels = labels[:, :logits.shape[1]]
-            # t matches logits (L), so we generally don't need to slice t if it came as (B, L)
-            # but if t was concatenated in collator, check here. 
-            # (Our BDM collator sends t as (B, L), so it matches logits)
+            if t.ndim > 1 and t.shape[1] > logits.shape[1]:
+                t = t[:, :logits.shape[1]]
 
         B, L, V = logits.shape
+        
         per_tok_loss = F.cross_entropy(
             logits.reshape(-1, V),
             labels.reshape(-1),
@@ -379,47 +380,8 @@ class DiffusionTrainer(Trainer):
             ignore_index=-100
         ).view(B, L)
         
-        # Loss weighting 1/t
         loss = (per_tok_loss / (t + 1e-4)).sum() / ((labels != -100).sum() + 1e-6)
         
-        if return_outputs:
-            return loss, outputs
-        return loss
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if "input_ids" in inputs and inputs["input_ids"].ndim == 3 and inputs["input_ids"].shape[1] == 1:
-            inputs["input_ids"] = inputs["input_ids"].squeeze(1)
-        
-        labels = inputs.pop("labels")
-        if labels.ndim == 3 and labels.shape[1] == 1:
-            labels = labels.squeeze(1)
-
-        t = inputs.pop("t") # This is (B,)
-
-        if "attention_mask" in inputs:
-            inputs.pop("attention_mask")
-
-        # Pass 1D timesteps to model
-        inputs["timesteps"] = t.squeeze().to(inputs["input_ids"].device)
-        
-        outputs = model(**inputs)
-        logits = outputs.logits
-
-        B, L, V = logits.shape
-        
-        if labels.shape[1] > L:
-            labels = labels[:, :L]
-
-        per_tok = F.cross_entropy(
-            logits.reshape(-1, V),
-            labels.reshape(-1),
-            reduction="none",
-            ignore_index=-100
-        ).view(B, L)
-
-        t_broadcast = t.view(B, 1).to(per_tok.device)
-        loss = (per_tok / t_broadcast).mean()
-
-        inputs["t"] = t
         if return_outputs:
             return loss, outputs
         return loss

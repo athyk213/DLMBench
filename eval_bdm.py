@@ -56,7 +56,14 @@ class BD3LMEvalHarness(LM):
 
         self.device = self.accelerator.device
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
-        self.mask_id = mask_id
+        
+        if self.tokenizer.mask_token_id is not None:
+            self.mask_id = self.tokenizer.mask_token_id
+            print(f"Using tokenizer mask_id: {self.mask_id}")
+        else:
+            self.mask_id = mask_id
+            print(f"Using default mask_id: {self.mask_id}")
+            
         self.mc_num = mc_num
         self.batch_size = int(batch_size)
         self.dtype = dtype
