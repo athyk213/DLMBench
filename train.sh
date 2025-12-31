@@ -58,7 +58,7 @@ fi
 # ==== final args ====
 batch_size=$(( local_batch_size / NGPUS ))
 gradient_accumulation_steps=$(( batch_size / micro_batch_size ))
-max_steps=10 
+max_steps=5
 
 # ../../hf_datasets/SlimPajama-627B
 # "/vcc-data/peihaow/SlimPajama-627B"
@@ -87,7 +87,7 @@ ${command} --nproc_per_node $NGPUS --nnodes $NNODES \
         --learning_rate 4e-4 \
         --adam_beta1 0.9 \
         --adam_beta2 0.98 \
-        --save_steps 10 \
+        --save_steps 5 \
         --logging_steps 1 \
         --do_train True \
         --do_predict True \

@@ -91,8 +91,8 @@ class DuoEvalHarness(LM):
 
     def _forward_process(self, batch, prompt_index):
         """
-        Applies Uniform Corruption.
-        Returns 1D timesteps (one per sequence) to match DUO architecture.
+        Applies Uniform Corruption: Replaces selected tokens with random tokens
+        uniformly sampled from the vocabulary.
         """
         b, l = batch.shape
 
@@ -100,10 +100,12 @@ class DuoEvalHarness(LM):
         
         k = torch.randint(1, target_len + 1, (), device=batch.device)
 
+        # Diffusion schedule x (tokens to mask)
         x = torch.round(torch.linspace(float(k), k + (b - 1) * (target_len / b), steps=b, device=batch.device)).long()
         x = ((x - 1) % target_len) + 1
         assert x.min() >= 1 and x.max() <= target_len
 
+        # Generate mask indices
         indices = torch.arange(target_len, device=batch.device).repeat(b, 1)
         is_mask = indices < x.unsqueeze(1)
 
@@ -112,10 +114,11 @@ class DuoEvalHarness(LM):
 
         is_mask = torch.cat((torch.zeros(b, prompt_index.sum(), dtype=torch.bool, device=batch.device), is_mask), dim=1)
 
+        # Random Uniform Noise
         random_noise = torch.randint(0, self.vocab_size, batch.shape, device=batch.device)
-        
         noisy_batch = torch.where(is_mask, random_noise, batch)
 
+        # Return 1D timesteps: Shape (B,)
         timesteps = (x / target_len)
         
         return noisy_batch, timesteps, is_mask
@@ -136,12 +139,16 @@ class DuoEvalHarness(LM):
         for _ in range(self.mc_num // self.batch_size):
             noisy_seq, timesteps, is_mask = self._forward_process(seq, prompt_index)
 
+            # Pass 1D timesteps to model
             logits = self.get_logits(noisy_seq, timesteps)
 
+            # Expand timesteps to (B, L) for loss weighting
             p_mask = timesteps.unsqueeze(1).expand_as(is_mask)
             
+            # Select only corrupted tokens for loss
             loss = F.cross_entropy(logits[is_mask], seq[is_mask], reduction='none')
             
+            # Normalize by probability of masking (timestep value at that position)
             loss = loss / p_mask[is_mask]
             
             loss = loss.sum() / self.batch_size
@@ -217,8 +224,8 @@ class DuoEvalHarness(LM):
         return out
 
     def loglikelihood_rolling(self, requests):
-        raise NotImplementedError
-
+        return NotImplementedError
+    
     def generate_until(self, requests: list[Instance]):
         def _tokenize(e):
             return {
