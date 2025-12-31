@@ -441,7 +441,19 @@ def train():
     #! Config and Model
     count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     config = AutoConfig.from_pretrained(model_args.config, trust_remote_code=True)
+
+    tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Base", use_fast=True)
+    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.mask_token is None: tokenizer.add_special_tokens({'mask_token': '<|mask|>'})
+
+    MASK_TOKEN = "<|mdm_mask|>"
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        mask_token_id = tokenizer.convert_tokens_to_ids(MASK_TOKEN)
+        tokenizer.mask_token_id = mask_token_id
+    print(f"*** Using {tokenizer.convert_ids_to_tokens(mask_token_id)} as mask_token ***")
     
+    # Select model & collator
     if "bd" in model_args.config.lower():
         print("*** Using BDM: Block Masking + Dual Stream ***")
         data_collator = DataCollatorForBlockDiffusion(tokenizer=tokenizer, block_size=32)
@@ -470,44 +482,6 @@ def train():
 
     if training_args.local_rank == 0:
         print(f"Training new model {model_args.config} from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
-
-    # elif model_args.model_name_or_path:
-    #     # config = AutoConfig.from_pretrained(model_args.model_name_or_path)
-    #     model = AutoModel.from_pretrained(model_args.model_name_or_path)
-    #     # if training_args.local_rank == 0:
-    #     print(f"Finetuning model from {model_args.model_name_or_path} - Model Size={count_func(model)/2**20:.2f}M parameters")
-    # else:
-    #     raise NotImplementedError
-
-    # determine if load from pretrained
-    # if training_args.finetune_from_pretrained:
-    #     pretrained_model = LlamaForCausalLM.from_pretrained(training_args.finetune_from_pretrained)
-    #     checkpoint = pretrained_model.state_dict()
-    #     def filter(key):
-    #         rotary = 'sin_cached' not in key and 'cos_cached' not in key
-    #         post_linear = "post_attention_linears" not in key
-    #         pe_proj = "pe.proj" not in key
-    #         return all((rotary, post_linear, pe_proj))
-    #     filtered_checkpoint = {k: v for k, v in checkpoint.items() if filter(k)}
-    #     model.load_state_dict(filtered_checkpoint, strict=False)
-
-    # tokenizer = AutoTokenizer.from_pretrained(
-    #     "/cusp-data-efa/peihaow/hf_models/llama-tokenizer",
-    #     use_fast=True,
-    # )
- 
-    tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Base", use_fast=True)
-
-
-    MASK_TOKEN = "<|mdm_mask|>"
-    mask_token_id = tokenizer.mask_token_id
-    if mask_token_id is None:
-        mask_token_id = tokenizer.convert_tokens_to_ids(MASK_TOKEN)
-        tokenizer.mask_token_id = mask_token_id
-    print(f"*** Using {tokenizer.convert_ids_to_tokens(mask_token_id)} as mask_token ***")
-
-    # if training_args.local_rank > 0: 
-    #     torch.distributed.barrier()
 
     lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached=None)
 
