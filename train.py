@@ -30,12 +30,8 @@ from typing import Optional
 # import wandb
 import transformers
 from transformers import Trainer, AutoTokenizer, AutoConfig, AutoModel, PreTrainedTokenizerBase
-from datasets import load_dataset, load_from_disk
-try:
-    from models import *
-except ImportError:
-    pass
-
+from datasets import load_dataset, load_from_disk, IterableDataset
+from models import *
 from typing import Dict, List, Union
 from torch.serialization import add_safe_globals
 from deepspeed.runtime.fp16.loss_scaler import LossScaler
@@ -49,6 +45,7 @@ CPU_COUNT = os.cpu_count()
 @dataclass
 class ModelArguments:
     config: Optional[str] = field(default=None)
+    # model_name_or_path: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -75,46 +72,201 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
+def get_processed_dataset(tokenizer, data_args, training_args, cached='tokenized'):
 
-def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized'):
+    # "../../hf_datasets/SlimPajama-627B"
     dpt = data_args.dataset_cache_dir
 
-    if os.path.exists(dpt):
-        print(f"*** Loading dataset from {dpt} ***")
-        train_raw_dataset = load_from_disk(os.path.join(dpt, 'train'))
-        val_raw_dataset = load_from_disk(os.path.join(dpt, 'validation'))
-    else:
-        print(f"*** Loading streaming dataset from DKYoon/SlimPajama-6B ***")
-        train_raw_dataset = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
-        val_raw_dataset = load_dataset("DKYoon/SlimPajama-6B", split='validation', streaming=True)
-    
-    def tokenize_function(examples):
-        return tokenizer(examples['text'], truncation=True, max_length=training_args.context_len)
+    assert cached in ['raw', 'tokenized', 'grouped'], "cached should be one of ['raw', 'tokenized', 'grouped']"
+    if cached == 'grouped':
+        print("Loading datasets: Grouped")
+        lm_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test_*.arrow"},
+            num_proc=CPU_COUNT,
+            split=None
+        )
+        return lm_datasets
 
+    elif cached == 'raw' or cached is None:
+        if cached is None:
+            raw_datasets = load_dataset("DKYoon/SlimPajama-6B", split=["train", 'validation'])
+        else:
+            raw_datasets = load_dataset("json",  # 本地路径
+                data_files={
+                    "train": f"{dpt}/train/*/*.jsonl.zst",
+                    "validation": f"{dpt}/validation/*/*.jsonl.zst",
+                    "test": f"{dpt}/test/*/*.jsonl.zst"
+                },
+                num_proc=CPU_COUNT,
+                split=None,
+            )
+
+        column_names = raw_datasets["train"].column_names
+        text_column_name = "text" if "text" in column_names else column_names[0]
+
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
+
+
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=column_names,
+            num_proc=CPU_COUNT,
+            load_from_cache_file=True,
+            cache_file_names={"train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train.arrow",\
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation.arrow", \
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test.arrow"},
+            desc="Running tokenizer on dataset",
+        )
+    elif cached == 'tokenized':
+        tokenized_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test_*.arrow"
+            },
+            num_proc=CPU_COUNT,
+            split=None
+        )
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
     def group_texts(examples):
-        concatenated = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated[list(examples.keys())[0]])
-        if total_length >= training_args.context_len:
-            total_length = (total_length // training_args.context_len) * training_args.context_len
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // training_args.context_len) * training_args.context_len
+        # Split by chunks of max_len.
         result = {
             k: [t[i : i + training_args.context_len] for i in range(0, total_length, training_args.context_len)]
-            for k, t in concatenated.items()
+            for k, t in concatenated_examples.items()
         }
         result["labels"] = result["input_ids"].copy()
         return result
 
-    if cached == 'raw':
-        return {"train": train_raw_dataset, "validation": val_raw_dataset}
-    
-    tokenized_datasets = train_raw_dataset.map(tokenize_function, batched=True, remove_columns=["text", "meta", "redpajama_set_name"])
-    lm_datasets = {"train": tokenized_datasets.map(group_texts, batched=True), 
-                   "validation": val_raw_dataset.map(tokenize_function, batched=True, remove_columns=["text", "meta", "redpajama_set_name"]).map(group_texts, batched=True)}
-    
+    os.makedirs(f"{data_args.dataset_cache_dir}/{training_args.context_len}", exist_ok=True)
+
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=CPU_COUNT,
+        load_from_cache_file=True,
+        cache_file_names={"train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train.arrow",\
+            "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation.arrow", \
+            "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test.arrow"},
+        desc=f"Grouping texts in chunks of {training_args.context_len}",
+    )
     return lm_datasets
 
-# ==============================================================================
-# Data Collators
-# ==============================================================================
+def get_streaming_dataset(tokenizer, data_args, training_args, cached='tokenized'):
+
+    # "../../hf_datasets/SlimPajama-627B"
+    dpt = data_args.dataset_cache_dir
+
+    assert cached in ['raw', 'tokenized', 'grouped', None], "cached should be one of ['raw', 'tokenized', 'grouped']"
+
+    if cached == 'grouped':
+        print("Loading datasets: Grouped")
+        lm_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/{training_args.context_len}/lm_datasets_test_*.arrow"},
+            split=None,
+            streaming=True
+        )
+        return lm_datasets
+
+    elif cached == 'tokenized':
+        tokenized_datasets = load_dataset(
+            "arrow",
+            data_files={
+                "train": f"{data_args.dataset_cache_dir}/tokenized_datasets_train_*.arrow",
+                "validation": f"{data_args.dataset_cache_dir}/tokenized_datasets_validation_*.arrow",
+                "test": f"{data_args.dataset_cache_dir}/tokenized_datasets_test_*.arrow"
+            },
+            split=None,
+            streaming=True
+        )
+
+    else: # raw
+        if cached is None:
+            from datasets import IterableDatasetDict
+            train_raw_dataset = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
+            val_raw_dataset = load_dataset("DKYoon/SlimPajama-6B", split='validation', streaming=True)
+            raw_datasets = IterableDatasetDict({"train": train_raw_dataset, "validation": val_raw_dataset})
+        else:
+            assert cached == 'raw', "cached should be one of ['raw', 'tokenized', 'grouped', None]"
+            raw_datasets = load_dataset("json",  # 本地路径
+                data_files={
+                    "train": f"{dpt}/train/*/*.jsonl.zst",
+                    "validation": f"{dpt}/validation/*/*.jsonl.zst",
+                    "test": f"{dpt}/test/*/*.jsonl.zst"
+                },
+                # num_proc=CPU_COUNT,
+                split=None,
+                streaming=True
+            )
+
+        def infer_columns_of_dataset(raw_datasets):
+            default_cols = raw_datasets.features
+        
+            if default_cols is not None:
+                return list(default_cols)
+        
+            first_example = next(iter(raw_datasets))
+            if isinstance(first_example, dict):
+                return list(first_example.keys())
+            else:
+                raise ValueError(f'Unable to infer column names from the data type: {type(first_example)}')
+
+
+        # column_names = raw_datasets["train"].column_names
+        column_names = infer_columns_of_dataset(raw_datasets["train"])
+        text_column_name = "text" if "text" in column_names else column_names[0]
+
+        def tokenize_function(examples):
+            return tokenizer(examples[text_column_name])
+        
+
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=column_names,
+        )
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        total_length = (total_length // training_args.context_len) * training_args.context_len
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + training_args.context_len] for i in range(0, total_length, training_args.context_len)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    os.makedirs(f"{data_args.dataset_cache_dir}/{training_args.context_len}", exist_ok=True)
+
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+    )
+
+    return lm_datasets
 
 @dataclass
 class DataCollatorForMaskedDiffusion:
@@ -124,8 +276,8 @@ class DataCollatorForMaskedDiffusion:
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of)
         input_ids = batch["input_ids"]
-        
         B, L = input_ids.shape
+        
         t = torch.rand(B, 1, device=input_ids.device)
         t = torch.clamp(t, 1e-4, 1.0)
         
@@ -138,12 +290,7 @@ class DataCollatorForMaskedDiffusion:
         
         labels[~mask_indices] = -100
         
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": batch["attention_mask"],
-            "t": t 
-        }
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": batch["attention_mask"], "t": t}
 
 @dataclass
 class DataCollatorForUniformDiffusion:
@@ -161,19 +308,14 @@ class DataCollatorForUniformDiffusion:
         mask_prob = t.expand(B, L)
         corrupt_indices = torch.bernoulli(mask_prob).bool()
         
-        # UDM Logic: Random Token Replacement
+        # UDM Logic: Replace with RANDOM tokens from vocab
         random_noise = torch.randint(0, self.tokenizer.vocab_size, (B, L), device=input_ids.device)
         corrupted_ids = torch.where(corrupt_indices, random_noise, input_ids)
         
         labels = input_ids.clone()
         labels[~corrupt_indices] = -100
         
-        return {
-            "input_ids": corrupted_ids,
-            "labels": labels,
-            "attention_mask": batch["attention_mask"],
-            "t": t
-        }
+        return {"input_ids": corrupted_ids, "labels": labels, "attention_mask": batch["attention_mask"], "t": t}
 
 @dataclass
 class DataCollatorForBlockDiffusion:
@@ -183,24 +325,20 @@ class DataCollatorForBlockDiffusion:
     
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of)
-        input_ids = batch["input_ids"] # x0
+        input_ids = batch["input_ids"] # Clean x0
         B, L = input_ids.shape
         
         num_blocks = (L + self.block_size - 1) // self.block_size
-        
-        # Sample t per block
         t_blocks = torch.rand(B, num_blocks, device=input_ids.device)
         t_blocks = torch.clamp(t_blocks, 1e-4, 1.0)
-        
         t_expanded = t_blocks.repeat_interleave(self.block_size, dim=1)[:, :L]
         
-        mask_prob = t_expanded
-        mask_indices = torch.bernoulli(mask_prob).bool()
+        mask_indices = torch.bernoulli(t_expanded).bool()
         
         xt = input_ids.clone()
         xt[mask_indices] = self.tokenizer.mask_token_id
         
-        # Dual-Stream Input: [Noisy, Clean]
+        # Dual-Stream Input: [Noisy, Clean] - Required for BDM Attention
         model_input = torch.cat([xt, input_ids], dim=1)
         
         labels = torch.full((B, 2*L), -100, dtype=input_ids.dtype, device=input_ids.device)
@@ -208,38 +346,32 @@ class DataCollatorForBlockDiffusion:
         labels_xt[~mask_indices] = -100
         labels[:, :L] = labels_xt
         
-        return {
-            "input_ids": model_input,
-            "labels": labels,
-            "t": t_expanded
-        }
-
-# ==============================================================================
-# Trainer
-# ==============================================================================
+        return {"input_ids": model_input, "labels": labels, "t": t_expanded}
 
 class DiffusionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         t = inputs.pop("t")
         
-        # Clean up specialized inputs
-        if "attention_mask" in inputs: inputs.pop("attention_mask")
+        if "attention_mask" in inputs: 
+            inputs.pop("attention_mask")
         
-        # Prepare timesteps
+        # Prepare 1D timesteps for model conditioning
         t_mean = t.mean(dim=1) if t.ndim > 1 else t.squeeze()
         inputs["timesteps"] = t_mean
         
         outputs = model(**inputs)
-        logits = outputs.logits
+        logits = outputs.logits if hasattr(outputs, "logits") else outputs
         
-        # Align BDM outputs if necessary
+        # BDM Specific: Model output might be length L (just xt), but labels are 2L (xt + x0)
+        # We slice labels to match logits
         if logits.shape[1] != labels.shape[1]:
             labels = labels[:, :logits.shape[1]]
-            t = t[:, :logits.shape[1]]
+            # t matches logits (L), so we generally don't need to slice t if it came as (B, L)
+            # but if t was concatenated in collator, check here. 
+            # (Our BDM collator sends t as (B, L), so it matches logits)
 
         B, L, V = logits.shape
-        
         per_tok_loss = F.cross_entropy(
             logits.reshape(-1, V),
             labels.reshape(-1),
@@ -247,72 +379,197 @@ class DiffusionTrainer(Trainer):
             ignore_index=-100
         ).view(B, L)
         
+        # Loss weighting 1/t
         loss = (per_tok_loss / (t + 1e-4)).sum() / ((labels != -100).sum() + 1e-6)
         
         if return_outputs:
             return loss, outputs
         return loss
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if "input_ids" in inputs and inputs["input_ids"].ndim == 3 and inputs["input_ids"].shape[1] == 1:
+            inputs["input_ids"] = inputs["input_ids"].squeeze(1)
+        
+        labels = inputs.pop("labels")
+        if labels.ndim == 3 and labels.shape[1] == 1:
+            labels = labels.squeeze(1)
 
-class CSVLoggerCallback(transformers.TrainerCallback):
-    def __init__(self, log_path):
-        self.log_path = log_path
-        self.header_written = False
+        t = inputs.pop("t") # This is (B,)
 
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is not None:
-            # Filter logs to save only loss and learning rate
-            row = {k: v for k, v in logs.items() if k in ["loss", "learning_rate", "epoch", "step"]}
-            if "epoch" not in row:
-                row["epoch"] = state.epoch
-            if "step" not in row:
-                row["step"] = state.global_step
-            
-            if row:
-                file_exists = os.path.isfile(self.log_path)
-                with open(self.log_path, mode='a', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=row.keys())
-                    if not file_exists and not self.header_written:
-                        writer.writeheader()
-                        self.header_written = True
-                    writer.writerow(row)
+        if "attention_mask" in inputs:
+            inputs.pop("attention_mask")
+
+        # Pass 1D timesteps to model
+        inputs["timesteps"] = t.squeeze().to(inputs["input_ids"].device)
+        
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        B, L, V = logits.shape
+        
+        if labels.shape[1] > L:
+            labels = labels[:, :L]
+
+        per_tok = F.cross_entropy(
+            logits.reshape(-1, V),
+            labels.reshape(-1),
+            reduction="none",
+            ignore_index=-100
+        ).view(B, L)
+
+        t_broadcast = t.view(B, 1).to(per_tok.device)
+        loss = (per_tok / t_broadcast).mean()
+
+        inputs["t"] = t
+        if return_outputs:
+            return loss, outputs
+        return loss
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+
+    def make_rank0_print(training_args):
+        def _print(*args, **kwargs):
+            if training_args.process_index == 0:
+                builtins.print(*args, **kwargs)
+        return _print
+
+    #! affecting all processes
+    print = make_rank0_print(training_args)
+
+    #! Config and Model
+    count_func = lambda model: sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
     config = AutoConfig.from_pretrained(model_args.config, trust_remote_code=True)
     
-    # Model Selection
-    if "ar" in model_args.config.lower():
-        model = transformers.AutoModelForCausalLM.from_config(config)
+    if "bd" in model_args.config.lower():
+        print("*** Using BDM: Block Masking + Dual Stream ***")
+        data_collator = DataCollatorForBlockDiffusion(tokenizer=tokenizer, block_size=32)
+        TrainerClass = DiffusionTrainer
+        Model_CLS = AutoModel
+    elif "udm" in model_args.config.lower():
+        print("*** Using UDM: Random Token Corruption ***")
+        data_collator = DataCollatorForUniformDiffusion(tokenizer=tokenizer)
+        TrainerClass = DiffusionTrainer
+        Model_CLS = AutoModel
+    elif "mdm" in model_args.config.lower():
+        print("*** Using MDM: Standard Masking ***")
+        data_collator = DataCollatorForMaskedDiffusion(tokenizer=tokenizer)
+        TrainerClass = DiffusionTrainer
+        Model_CLS = AutoModel
+    elif "ar" in model_args.config.lower():
+        print("*** Using AR: Standard Causal LM ***")
+        data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
+        TrainerClass = transformers.Trainer
+        Model_CLS = transformers.AutoModelForCausalLM
+        config.max_position_embeddings = training_args.context_len
     else:
-        model = AutoModel.from_config(config, trust_remote_code=True)
+        raise ValueError(f"Unknown model type in config: {model_args.config}")
 
+    model = Model_CLS.from_config(config, trust_remote_code=True)
+
+    if training_args.local_rank == 0:
+        print(f"Training new model {model_args.config} from scratch - Total Size={count_func(model)/2**20:.2f}M parameters")
+
+    # elif model_args.model_name_or_path:
+    #     # config = AutoConfig.from_pretrained(model_args.model_name_or_path)
+    #     model = AutoModel.from_pretrained(model_args.model_name_or_path)
+    #     # if training_args.local_rank == 0:
+    #     print(f"Finetuning model from {model_args.model_name_or_path} - Model Size={count_func(model)/2**20:.2f}M parameters")
+    # else:
+    #     raise NotImplementedError
+
+    # determine if load from pretrained
+    # if training_args.finetune_from_pretrained:
+    #     pretrained_model = LlamaForCausalLM.from_pretrained(training_args.finetune_from_pretrained)
+    #     checkpoint = pretrained_model.state_dict()
+    #     def filter(key):
+    #         rotary = 'sin_cached' not in key and 'cos_cached' not in key
+    #         post_linear = "post_attention_linears" not in key
+    #         pe_proj = "pe.proj" not in key
+    #         return all((rotary, post_linear, pe_proj))
+    #     filtered_checkpoint = {k: v for k, v in checkpoint.items() if filter(k)}
+    #     model.load_state_dict(filtered_checkpoint, strict=False)
+
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     "/cusp-data-efa/peihaow/hf_models/llama-tokenizer",
+    #     use_fast=True,
+    # )
+ 
     tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Base", use_fast=True)
-    if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.mask_token is None: tokenizer.add_special_tokens({'mask_token': '<|mask|>'})
 
-    lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args)
+
+    MASK_TOKEN = "<|mdm_mask|>"
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        mask_token_id = tokenizer.convert_tokens_to_ids(MASK_TOKEN)
+        tokenizer.mask_token_id = mask_token_id
+    print(f"*** Using {tokenizer.convert_ids_to_tokens(mask_token_id)} as mask_token ***")
+
+    # if training_args.local_rank > 0: 
+    #     torch.distributed.barrier()
+
+    lm_datasets = get_streaming_dataset(tokenizer, data_args, training_args, cached=None)
+
+    print(f"*** Datasets Loaded ***")
+
     train_dataset = lm_datasets["train"]
     valid_dataset = lm_datasets["validation"]
 
-    # Collator Selection
-    if "udm" in model_args.config.lower():
-        print("*** UDM: Random Token Corruption ***")
-        data_collator = DataCollatorForUniformDiffusion(tokenizer=tokenizer)
-        TrainerClass = DiffusionTrainer
-    elif "bdm" in model_args.config.lower():
-        print("*** BDM: Block Masking + Dual Stream Input ***")
-        data_collator = DataCollatorForBlockDiffusion(tokenizer=tokenizer, block_size=32)
-        TrainerClass = DiffusionTrainer
-    elif "mdm" in model_args.config.lower():
-        print("*** MDM: Standard Masking ***")
-        data_collator = DataCollatorForMaskedDiffusion(tokenizer=tokenizer)
-        TrainerClass = DiffusionTrainer
-    else:
-        # AR Model - Standard HF Trainer
-        data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
-        TrainerClass = Trainer
+
+    data_module = dict(
+        train_dataset=train_dataset, eval_dataset=valid_dataset, data_collator=data_collator
+        )
+
+    # Tell Trainer not to attempt DataParallel
+    model.is_parallelizable = True
+    model.model_parallel = True
+
+    #! For Iteratable: do not skip streaming dataset but use a new shuffle for resume.
+    n_lastest_iter = 0
+    if training_args.resume_from_checkpoint == True:
+        # search for the latest checkpoint
+        from pathlib import Path
+        all_checkpoints = list(Path(training_args.output_dir).glob("checkpoint-*"))
+        all_checkpoints = [x for x in all_checkpoints if (x / "trainer_state.json").exists() and not x.name.endswith("final")]
+        if len(all_checkpoints) == 0:
+            training_args.resume_from_checkpoint = None
+            print("No checkpoint found, starting from scratch")
+        else:
+            all_checkpoints = [str(x) for x in all_checkpoints]
+            latest_checkpoint = max(all_checkpoints, key=os.path.getctime)
+            training_args.resume_from_checkpoint = latest_checkpoint
+            print("Resuming from checkpoint", latest_checkpoint)
+            n_lastest_iter = int(latest_checkpoint.split('-')[-1])
+
+    if isinstance(train_dataset, IterableDataset):
+        shuffle_seed = training_args.data_seed + n_lastest_iter if training_args.data_seed is not None else training_args.seed + n_lastest_iter
+        train_dataset = train_dataset.shuffle(seed=shuffle_seed)
+        training_args.ignore_data_skip = True
+        print("*** Set ignore_data_skip=True for streaming mode to save time ***")
+
+
+    class CSVLoggerCallback(transformers.TrainerCallback):
+        def __init__(self, log_path="training_logs.csv"):
+            self.log_path = log_path
+            self.header_written = False
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs is None:
+                return
+            row = {
+                "step": state.global_step,
+                "epoch": state.epoch,
+                "loss": logs.get("loss", ""),
+                "learning_rate": logs.get("learning_rate", ""),
+            }
+            file_exists = os.path.isfile(self.log_path)
+            with open(self.log_path, mode='a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=["step", "epoch", "loss", "learning_rate"])
+                if not file_exists and not self.header_written:
+                    writer.writeheader()
+                    self.header_written = True
+                writer.writerow(row)
 
     # Determine log path based on config name
     config_name = os.path.splitext(os.path.basename(model_args.config))[0]
@@ -329,13 +586,13 @@ def train():
         data_collator=data_collator,
         callbacks=[CSVLoggerCallback(log_path=log_path)]
     )
-    
     model.config.use_cache = False
 
     if training_args.do_train:
         logging.info("*** Start Training ***")
         trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_state()
+        # trainer.save_model(output_dir=training_args.output_dir)
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
     if training_args.do_eval:
@@ -346,4 +603,11 @@ def train():
         
 
 if __name__ == "__main__":
+    # wandb.init(
+    #     project="IBSSM",
+    #     entity="jiajun_vita",
+    #     id=os.getenv("SLURM_JOB_NAME", "interact"),
+    #     resume='allow',
+    #     )
+    transformers.logging.set_verbosity_warning()
     train()
