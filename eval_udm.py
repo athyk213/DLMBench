@@ -224,7 +224,25 @@ class DuoEvalHarness(LM):
         return out
 
     def loglikelihood_rolling(self, requests):
-        return NotImplementedError
+        out = []
+        for (string,) in tqdm(requests, desc="Computing rolling likelihood..."):
+            tokens = self.tokenizer(string, return_tensors="pt")["input_ids"].to(self.device)
+            seq = tokens.view(-1)
+            
+            total_ll = 0.0
+            for i in range(0, len(seq), self.block_length):
+                target_block = seq[i : i + self.block_length]
+                if i == 0:
+                    history = torch.tensor([], dtype=torch.long, device=self.device)
+                else:
+                    history_start = max(0, i - (self.max_length - self.block_length))
+                    history = seq[history_start:i]
+                
+                block_ll = self.get_loglikelihood(history, target_block)
+                total_ll += block_ll
+            out.append(total_ll)
+            
+        return out
     
     def generate_until(self, requests: list[Instance]):
         def _tokenize(e):

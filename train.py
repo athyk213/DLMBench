@@ -36,6 +36,7 @@ from models import *
 from typing import Dict, List, Union
 from torch.serialization import add_safe_globals
 from deepspeed.runtime.fp16.loss_scaler import LossScaler
+from noise import LogLinearNoise
 
 add_safe_globals([LossScaler])
 
@@ -291,7 +292,12 @@ class DataCollatorForMaskedDiffusion:
         
         labels[~mask_indices] = -100
         
-        return {"input_ids": input_ids, "labels": labels, "attention_mask": batch["attention_mask"], "t": t}
+        # LLaDA/MDM loss weight is -1/t
+        loss_scale = -1.0 / t
+        # Expand loss_scale to match (B, L) for the trainer
+        loss_scale = loss_scale.expand(B, L)
+        
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": batch["attention_mask"], "loss_scale": loss_scale}
 
 @dataclass
 class DataCollatorForUniformDiffusion:
@@ -309,14 +315,18 @@ class DataCollatorForUniformDiffusion:
         mask_prob = t.expand(B, L)
         corrupt_indices = torch.bernoulli(mask_prob).bool()
         
-        # UDM Logic: Replace with RANDOM tokens from vocab
+        # Replace with RANDOM tokens from vocab
         random_noise = torch.randint(0, self.tokenizer.vocab_size, (B, L), device=input_ids.device)
         corrupted_ids = torch.where(corrupt_indices, random_noise, input_ids)
         
         labels = input_ids.clone()
         labels[~corrupt_indices] = -100
         
-        return {"input_ids": corrupted_ids, "labels": labels, "attention_mask": batch["attention_mask"], "t": t}
+        # UDM loss weight is -1/t
+        loss_scale = -1.0 / t
+        loss_scale = loss_scale.expand(B, L)
+        
+        return {"input_ids": corrupted_ids, "labels": labels, "attention_mask": batch["attention_mask"], "loss_scale": loss_scale, "timesteps": t.squeeze(-1)}
 
 @dataclass
 class DataCollatorForBlockDiffusion:
@@ -324,22 +334,39 @@ class DataCollatorForBlockDiffusion:
     block_size: int = 32
     pad_to_multiple_of: int = None
     
+    def __post_init__(self):
+        self.noise = LogLinearNoise()
+
+    def _sigma_from_p(self, p):
+        return torch.min(- torch.log(1 - p), self.noise.sigma_max)
+    
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of)
         input_ids = batch["input_ids"] # Clean x0
         B, L = input_ids.shape
         
         num_blocks = (L + self.block_size - 1) // self.block_size
-        t_blocks = torch.rand(B, num_blocks, device=input_ids.device)
-        t_blocks = torch.clamp(t_blocks, 1e-4, 1.0)
+        
+        # Sample t uniformly
+        sampling_eps_min = 1e-3
+        sampling_eps_max = 1.0
+        t_blocks = torch.rand(B, num_blocks, device=input_ids.device) * (sampling_eps_max - sampling_eps_min) + sampling_eps_min
         t_expanded = t_blocks.repeat_interleave(self.block_size, dim=1)[:, :L]
         
-        mask_indices = torch.bernoulli(t_expanded).bool()
+        # Get loss scale and move prob from noise schedule
+        loss_scale, p = self.noise(t_expanded)
         
+        # Sample masks based on p
+        mask_indices = torch.rand_like(p) < p
+        
+        # Create xt (masked input)
         xt = input_ids.clone()
         xt[mask_indices] = self.tokenizer.mask_token_id
         
-        # Dual-Stream Input: [Noisy, Clean] - Required for BDM Attention
+        # Calculate sigma for conditioning
+        sigma = self._sigma_from_p(p)
+        
+        # Dual-Stream Input: [Noisy, Clean]
         model_input = torch.cat([xt, input_ids], dim=1)
         
         labels = torch.full((B, 2*L), -100, dtype=input_ids.dtype, device=input_ids.device)
@@ -347,40 +374,63 @@ class DataCollatorForBlockDiffusion:
         labels_xt[~mask_indices] = -100
         labels[:, :L] = labels_xt
         
-        return {"input_ids": model_input, "labels": labels, "t": t_expanded}
+        # Pass loss_scale to compute_loss
+        return {"input_ids": model_input, "labels": labels, "timesteps": sigma, "loss_scale": loss_scale}
 
 class DiffusionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
-        t = inputs.pop("t")
+        loss_scale = inputs.pop("loss_scale")
+        
+        timesteps = inputs.pop("timesteps", None)
         
         if "attention_mask" in inputs: 
             inputs.pop("attention_mask")
         
-        t_mean = t.mean(dim=1) if t.ndim > 1 else t.squeeze()
+        # Check if model accepts timesteps
         model_module = model.module if hasattr(model, "module") else model
         forward_params = inspect.signature(model_module.forward).parameters
-        if "timesteps" in forward_params:
-            inputs["timesteps"] = t_mean
+        
+        if "timesteps" in forward_params and timesteps is not None:
+            inputs["timesteps"] = timesteps
 
         outputs = model(**inputs)
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
         
         if logits.shape[1] != labels.shape[1]:
             labels = labels[:, :logits.shape[1]]
-            if t.ndim > 1 and t.shape[1] > logits.shape[1]:
-                t = t[:, :logits.shape[1]]
+            loss_scale = loss_scale[:, :logits.shape[1]]
 
         B, L, V = logits.shape
         
-        per_tok_loss = F.cross_entropy(
-            logits.reshape(-1, V),
-            labels.reshape(-1),
-            reduction="none",
-            ignore_index=-100
-        ).view(B, L)
+        # Get log probabilities of the target tokens        
+        # Flatten for gather
+        logits_flat = logits.reshape(-1, V)
+        labels_flat = labels.reshape(-1)
         
-        loss = (per_tok_loss / (t + 1e-4)).sum() / ((labels != -100).sum() + 1e-6)
+        # We only care about labels that are NOT -100
+        valid_mask = labels_flat != -100
+        
+        if valid_mask.sum() == 0:
+             return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        # Compute log_softmax
+        log_probs = F.log_softmax(logits_flat, dim=-1)
+        
+        # Gather the log-prob of the correct token
+        target_log_probs = log_probs[torch.arange(logits_flat.shape[0], device=logits.device), labels_flat]
+        
+        # Reshape back to (B, L)
+        target_log_probs = target_log_probs.view(B, L)
+        valid_mask = valid_mask.view(B, L)
+        
+        # Scale by loss scale        
+        per_tok_loss = loss_scale * target_log_probs
+        
+        # Mask out ignored tokens
+        per_tok_loss = per_tok_loss * valid_mask.float()
+        
+        loss = per_tok_loss.sum() / (valid_mask.sum() + 1e-6)
         
         if return_outputs:
             return loss, outputs

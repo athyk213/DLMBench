@@ -10,7 +10,8 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate 
+from generate import generate
+from noise import LogLinearNoise
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -72,6 +73,11 @@ class BD3LMEvalHarness(LM):
         self.steps = steps
         self.gen_length = gen_length
         self.block_length = getattr(config, 'block_size', block_length)
+        
+        self.noise = LogLinearNoise()
+
+    def _sigma_from_p(self, p):
+        return torch.min(- torch.log(1 - p), self.noise.sigma_max)
 
     def _forward_process(self, batch, prompt_index):
         b, l = batch.shape
@@ -95,7 +101,10 @@ class BD3LMEvalHarness(LM):
         
         p_mask = timesteps_1d.unsqueeze(1).repeat(1, l)
         
-        return model_input, timesteps_1d.to(dtype=self.dtype), p_mask.to(dtype=self.dtype), is_mask
+        # Convert t (probability p) to sigma
+        sigma = self._sigma_from_p(timesteps_1d)
+        
+        return model_input, sigma.to(dtype=self.dtype), p_mask.to(dtype=self.dtype), is_mask
 
     @torch.no_grad()
     def get_loglikelihood(self, prefix, target):
@@ -105,13 +114,14 @@ class BD3LMEvalHarness(LM):
 
         loss_acc = []
         for _ in range(self.mc_num // self.batch_size):
-            model_input, t_1d, t_2d, is_mask = self._forward_process(seq, prompt_index)
+            model_input, sigma, t_2d, is_mask = self._forward_process(seq, prompt_index)
             
-            logits = self.model(input_ids=model_input, timesteps=t_1d, sample_mode=False).logits
+            # Pass sigma as timesteps
+            logits = self.model(input_ids=model_input, timesteps=sigma, sample_mode=False).logits
             
             loss = F.cross_entropy(logits[is_mask], seq[is_mask], reduction='none')
             
-            # Weighting
+            # Weighting by 1/t (which is -loss_scaling for LogLinearNoise)
             loss = loss / t_2d[is_mask]
             
             loss = loss.sum() / self.batch_size
