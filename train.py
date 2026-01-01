@@ -324,7 +324,7 @@ class DataCollatorForUniformDiffusion:
         
         # UDM loss weight is -1/t
         loss_scale = -1.0 / t
-        loss_scale = loss_scale.expand(B, L)
+        loss_scale = loss_scale.expand(B, L).clone()
         
         return {"input_ids": corrupted_ids, "labels": labels, "attention_mask": batch["attention_mask"], "loss_scale": loss_scale, "timesteps": t.squeeze(-1)}
 
